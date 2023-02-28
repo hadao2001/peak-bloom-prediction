@@ -1,0 +1,454 @@
+---
+title: "Dataset download for Cherry Trees Prediction "
+author: "Ha Dao"
+date: "01/01/2023"
+output:
+  html_document:
+    df_print: kable
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, error = FALSE, 
+                      message = FALSE,
+                      fig.align = 'center',
+                      out.width = '80%')
+```
+
+- Data Exploration and Visualizing (intial)
+```{r}
+library(tidyverse)
+library(rnoaa)     # Weather data
+library(imputeTS)  # Imputation on the temperature
+library(lubridate)
+library(randomForest) 
+library(e1071)     # SVM
+library(ggsci)     # Color
+library(corrplot)  # Correlation plot
+library(hash)
+library(grid)
+library(ggnewscale)
+library(ggtext)
+library(tidyverse)
+
+```
+
+## Bloom data from 3 main locations: 
+```{r}
+# Blossom data from 3 main locations: 
+cherry <- read.csv("peak-bloom-prediction-main-2/data/washingtondc.csv") %>% 
+  bind_rows(read.csv("peak-bloom-prediction-main-2/data/liestal.csv")) %>% 
+  bind_rows(read.csv("peak-bloom-prediction-main-2/data/kyoto.csv")) %>%
+  bind_rows(read.csv("peak-bloom-prediction-main-2/data/vancouver.csv")) 
+```
+
+Bloom date data from Liestal (since we can't find data for Vancouver): 
+```{r}
+# We will try to use K-means to see wheter weather from Vancouver is most similar to which country  
+
+# https://highparknaturecentre.com/index.php/cherry-blossom-bloom-tracking
+# Peak Bloom date from Liestal ( might be better if I can find data for Cali bloomdate)
+cherry_vc <- cherry %>%
+  filter(location %in% c("liestal")) %>%
+  select(year, bloom_date, bloom_doy)
+         
+# cherry_vc <- cherry_vc %>%
+#   #mutate(bloom_date = as.POSIXct(bloom_date, format = '%m/%d/%Y')) %>%
+#   #mutate(year = as.integer(format(bloom_date, "%Y"))) %>%
+#   #mutate(bloom_doy = yday(bloom_date)) %>%
+#   mutate(location = "vancouver")
+#   #mutate(bloom_date = as.character(bloom_date))
+#   #select(location, year, bloom_date, bloom_doy)
+# 
+# cherry_vc <- cherry_vc %>%
+#   filter(year %in% c(2006:2023))
+# 
+# 
+# cherry <- cherry %>% select(location, year, bloom_date, bloom_doy) %>%
+#   bind_rows(cherry_vc)
+
+
+```
+
+
+```{r}
+cherry %>% 
+  group_by(location) %>% 
+  slice_head(n = 4) 
+```
+## Visualizing the time series
+```{r, fig.width=8, fig.height=3, out.width='100%', fig.cap="Time series of peak bloom of cherry trees since 1880 at three different sites."}
+cherry %>% 
+  filter(year >= 1960) %>%
+  ggplot(aes(x = year, y = bloom_doy)) +
+  geom_point() +
+  geom_step(linetype = 'dotted', color = 'gray50') +
+  scale_x_continuous(breaks = seq(1960, 2023, by = 20)) +
+  scale_y_continuous(breaks = seq(60, 150, by = 5)) +
+  facet_grid(cols = vars(str_to_title(location))) +
+  labs(x = "Year", y = "Peak bloom (days since Jan 1st)")
+```
+
+
+```{r, fig.cap="Distribution of peak bloom days across the four sites."}
+cherry %>%
+  ggplot() +
+  geom_density(aes(x = bloom_doy, fill = location), alpha = 0.7) +
+  scale_fill_npg() + theme_light()+
+  labs(x = "Peak bloom (days since Jan 1st)", y = "Density")
+```
+
+
+
+1. Get the weather data from RNOAA
+
+The list of stations can be retrieved using the `ghcnd_stations()` function. Note that the closest weather station to each city with continuously collected maximum temperatures are USC00186350 (Washington D.C.), GME00127786 (Liestal), JA000047759 (Kyoto), and CA001108395 (Vancouver).
+
+```{r, eval = FALSE}
+stations <- ghcnd_stations()
+```
+
+As a simple demonstration, we retrieve the average seasonal maximum daily temperature (in 1/10 °C) from these stations using our own `get_temperature()` function, which wraps the `ghcnd_search()` function in the `rnoaa` package. (N.b. `ghcnd_search()` returns a list. Each element of the list corresponds to an element of the `var` argument.)
+
+```{r}
+#' Get the annual average maximum temperature at the given station,
+#' separated into the 4 meteorological seasons (Winter, Spring, Summer, Fall).
+
+#' The seasons are span 3 months each.
+#' Winter is from December to February, Spring from March to May,
+#' Summer from June to August, and Fall from September to November.
+#' Note that December is counted towards the Winter of the next year, i.e.,
+#' temperatures in December 2020 are accounted for in Winter 2021.
+
+#' @param stationid the `rnoaa` station id (see [ghcnd_stations()])
+#' @return a data frame with columns
+#'   - `year` ... the year of the observations
+#'   - `season` ... the season (Winter, Spring, Summer, Fall)
+#'   - `tmax_avg` ... average maximum temperate in tenth degree Celsius
+# Define function to get weather data for a specific station and date range
+get_temperature <- function(station_id = station_id, date_range = c("1930-01-01", "2024-03-30")) {
+  
+  # Get daily maximum temperature data, minimum temperature and precipitation data
+  tmax <- ghcnd_search(stationid = station_id, var = c("tmax"), 
+                        date_min = date_range[1], date_max = date_range[2])[[1]]
+  tmin <- ghcnd_search(stationid = station_id, var = c("tmin"), 
+                        date_min = date_range[1], date_max = date_range[2])[[1]]
+  prcp <- ghcnd_search(stationid = station_id, var = c("prcp"), 
+                        date_min = date_range[1], date_max = date_range[2])[[1]]
+  # Merge with tmax
+  weather <- merge(tmax, tmin, by = "date") %>% merge(prcp, by = "date")
+  
+  # Select and transform relevant columns
+  weather <- weather %>% 
+    select(date, tmax, tmin, prcp) %>%
+    mutate(tmax = tmax/10, tmin = tmin/10, # Convert temperature to tenth of the C
+           year = as.integer(format(date, "%Y")),
+           month = as.integer(strftime(date, '%m')) %% 12, # Make December "0"
+           season = cut(month, breaks = c(0, 2, 5, 8, 11),
+                        include.lowest = TRUE,
+                        labels = c("Winter", "Spring", "Summer", "Fall")),
+           year = if_else(month == 0, year + 1L, year)) %>%
+    mutate(month_name = if_else(month == 0, 12, month)) %>%
+    mutate(month_name = factor(month.name[as.integer(month_name)], levels = month.name)) %>%
+    group_by(year, month, season) %>%
+    summarize(tmax_avg = mean(tmax, na.rm = TRUE),
+              tmax_max = max(tmax, na.rm = TRUE),
+              tmin_avg = mean(tmin, na.rm = TRUE),
+              tmin_min = min(tmin, na.rm = TRUE),
+              prcp_avg = mean(prcp, na.rm = TRUE),
+              avg_temp = (tmax_avg + tmin_avg)/2)
+
+  # Return transformed data
+  return(weather)
+}
+```
+
+```{r}
+#Get data
+historic_temperatures <-
+  tibble(location = "washingtondc", get_temperature("USC00186350")) %>%
+  bind_rows(tibble(location = "liestal", get_temperature("GME00127786"))) %>%
+  bind_rows(tibble(location = "kyoto", get_temperature("JA000047759"))) %>%
+  bind_rows(tibble(location = "vancouver", get_temperature("CA001108395")))
+
+```
+
+```{r}
+# DAILY TEMP
+get_temp_daily <- function(station_id = station_id, date_range = c("1930-01-01", "2023-03-30")) {
+  
+  # Get daily maximum temperature data, minimum temperature and precipitation data
+  tmax <- ghcnd_search(stationid = station_id, var = c("tmax"), 
+                        date_min = date_range[1], date_max = date_range[2])[[1]]
+  tmin <- ghcnd_search(stationid = station_id, var = c("tmin"), 
+                        date_min = date_range[1], date_max = date_range[2])[[1]]
+  prcp <- ghcnd_search(stationid = station_id, var = c("prcp"), 
+                        date_min = date_range[1], date_max = date_range[2])[[1]]
+  # Merge with tmax
+  weather <- merge(tmax, tmin, by = "date") %>% merge(prcp, by = "date")
+  
+  # Select and transform relevant columns
+  weather <- weather %>% 
+    select(date, tmax, tmin, prcp) %>%
+    mutate(tmax = tmax/10, tmin = tmin/10, # Convert temperature to tenth of the C
+           year = as.integer(format(date, "%Y")),
+           month = as.integer(strftime(date, '%m')) %% 12, # Make December "0"
+           season = cut(month, breaks = c(0, 2, 5, 8, 11),
+                        include.lowest = TRUE,
+                        labels = c("Winter", "Spring", "Summer", "Fall")),
+           year = if_else(month == 0, year + 1L, year)) %>%
+    mutate(month_name = if_else(month == 0, 12, month)) %>%
+    mutate(month_name = factor(month.name[as.integer(month_name)], levels = month.name)) 
+
+  # Return transformed data
+  return(weather)
+}
+```
+
+```{r}
+#Get data daily
+daily_temperatures <-
+  tibble(location = "washingtondc", get_temp_daily("USC00186350")) %>%
+  bind_rows(tibble(location = "liestal", get_temp_daily("GME00127786"))) %>%
+  bind_rows(tibble(location = "kyoto", get_temp_daily("JA000047759"))) %>%
+  bind_rows(tibble(location = "vancouver", get_temp_daily("CA001108395")))
+
+
+#Export file 
+write.csv(daily_temperatures, "daily_temperatures_impute_missing.csv", row.names = FALSE)
+```
+
+
+## Python: Using KNN to impute misisng value
+```{r}
+#File can be found in cherry_imputing_missing.ipnyb
+imputed_data <- read_csv("imputed_data.csv")
+
+```
+
+```{r}
+# Accumulative growing days: GDD=(Tmax+Tmin)/2-Tbase
+imputed_data <- imputed_data %>% 
+  mutate(gdd= (tmax+tmin)/2 - 0)
+View(imputed_data)
+
+```
+
+### Daily temperature would create too much noise for data -> using monthy temperature to model
+```{r}
+monthly_temp <- imputed_data %>%
+  group_by(location, year, month, season) %>%
+  summarize(tmax_avg = mean(tmax, na.rm = TRUE),
+            tmax_max = max(tmax, na.rm = TRUE),
+            tmin_avg = mean(tmin, na.rm = TRUE),
+            tmin_min = min(tmin, na.rm = TRUE),
+            gdd_avg = mean(gdd, na.rm = TRUE),
+            prcp_avg = mean(prcp, na.rm = TRUE))
+
+
+daily_temperatures%>% 
+  group_by(location) %>% 
+  slice_head(n = 5) 
+
+
+```
+
+```{r}
+yearly_temp <- monthly_temp %>%
+  filter(year >= 1960) %>%
+  select(location, year, tmax_avg, tmin_avg, gdd_avg) %>%
+  group_by(location, year) %>%
+  summarise_each(funs(mean=mean(., na.rm=TRUE)))
+
+# First, define colors.
+BROWN <- "#AD8C97"
+BROWN_DARKER <- "#7d3a46"
+GREEN <- "#00FF00"
+BLUE <- "#076FA1"
+GREY <- "#C7C9CB"
+GREY_DARKER <- "#5C5B5D"
+RED <- "#E3120B"
+  
+
+plt1 <- yearly_temp %>%
+  filter(year >= 1960) %>%
+  ggplot(aes(year, gdd_avg_mean)) +
+  geom_line(aes(color = location), size = 1, alpha=0.6) +
+  geom_point(
+    aes(fill = location), 
+    pch = 21, # Type of point that allows us to have both color (border) and fill.
+    color = "white", 
+    stroke = 1 # The width of the border, i.e. stroke.
+  ) +
+  # Set values for the color and the fill
+  scale_color_manual(values = c(BLUE, GREEN, BROWN, BROWN_DARKER)) +
+  scale_fill_manual(values = c(BLUE, GREEN, BROWN, BROWN_DARKER)) +
+  ggtitle("Yearly average temperature across 4 sites") +
+  xlab("Year") + 
+  ylab("Average Temperature")
+
+
+plt1 <- plt1 + 
+  scale_x_continuous(
+    limits = c(1960, 2022)) +
+  scale_y_continuous(
+    limits = c(0, 32),
+    breaks = seq(0, 30, by = 5), 
+    expand = c(0, 0)
+  ) + 
+  theme(
+    # Set background color to white
+    panel.background = element_rect(fill = "white"),
+    # Remove all grid lines
+    panel.grid = element_line(colour = "grey50")
+  )
+
+plt1
+```
+_____________________________________________________________________
+## Washington DC
+
+```{r}
+#import bloom date data
+washington_bloom <-  cherry %>%
+  filter(year >= 1960) %>%
+  filter(location == "washingtondc")
+
+
+#Filtering washington dc temperature
+washington_temp <- monthly_temp %>% 
+  filter(location == "washingtondc")
+
+
+```
+
+```{r}
+# Get label for bloom date WASHINGTON - TESTING 
+max(washington_bloom$bloom_doy) - min(washington_bloom$bloom_doy)
+
+# Since prediction day can be +- 3 days, we create a category to observe how bloom date differs through years
+washington_bloom$bloom_doy <- as.integer(washington_bloom$bloom_doy) 
+wash_bloom <- washington_bloom %>% 
+  select(lat, long, year, bloom_date, bloom_doy) %>%
+  mutate(cat_bloom_doy = cut(bloom_doy, breaks = 8, labels = c(0,1,2,3,4,5,6,7))) 
+head(wash_bloom)
+```
+
+```{r}
+# join the datasets based on the "year" column
+merged_washington <-left_join(wash_bloom, washington_temp, by='year')
+# view the merged dataset
+View(merged_washington)
+
+sapply(merged_washington, function(x) sum(is.na(x)))
+
+#Export file 
+write.csv(merged_washington, "merged_washington.csv", row.names = FALSE)
+```
+
+
+____________________________________________________________________________________________________
+## Kyoto
+```{r}
+#import bloom date data
+kyoto_bloom <-  cherry %>%
+  filter(year >= 1960) %>%
+  filter(location == "kyoto")
+
+
+#Filtering kyoto temperature
+kyoto_temp <- monthly_temp %>% 
+  filter(location == "kyoto")
+```
+
+```{r}
+# Get label for bloom date KYOTO - TESTING 
+max(kyoto_bloom$bloom_doy) - min(kyoto_bloom$bloom_doy)
+
+# Since prediction day can be +- 4 days, we create a category to observe how bloom date differs through years
+kyoto_bloom$bloom_doy <- as.integer(kyoto_bloom$bloom_doy) 
+kyoto_bloom <- kyoto_bloom %>% 
+  select(lat, long, year, bloom_date, bloom_doy) %>%
+  mutate(cat_bloom_doy = cut(bloom_doy, breaks = 6, labels = c(0,1,2,3,4,5))) 
+head(kyoto_bloom)
+```
+
+```{r}
+# join the datasets based on the "year" column
+merged_kyoto <-left_join(kyoto_bloom, kyoto_temp, by='year')
+# view the merged dataset
+View(merged_kyoto)
+
+sapply(merged_kyoto, function(x) sum(is.na(x)))
+
+#Export file 
+write.csv(merged_kyoto, "merged_kyoto.csv", row.names = FALSE)
+```
+
+____________________________________________________________________________________________________
+## Liestal
+```{r}
+#import bloom date data
+liestal_bloom <-  cherry %>%
+  filter(year >= 1960) %>%
+  filter(location == "liestal")
+
+
+#Filtering liestal temperature
+liestal_temp <- monthly_temp %>% 
+  filter(location == "liestal")
+```
+
+```{r}
+# Get label for bloom date LIESTAL - TESTING 
+max(liestal_bloom$bloom_doy) - min(liestal_bloom$bloom_doy)
+
+# Since prediction day can be +- 4 days, we create a category to observe how bloom date differs through years
+liestal_bloom$bloom_doy <- as.integer(liestal_bloom$bloom_doy) 
+liestal_bloom <- liestal_bloom %>% 
+  select(lat, long, year, bloom_date, bloom_doy) %>%
+  mutate(cat_bloom_doy = cut(bloom_doy, breaks = 11, labels = c(0,1,2,3,4,5,6,7,8,9,10))) 
+head(liestal_bloom)
+```
+
+```{r}
+# join the datasets based on the "year" column
+merged_liestal <-left_join(liestal_bloom, liestal_temp, by='year')
+# view the merged dataset
+View(merged_liestal)
+
+sapply(merged_liestal, function(x) sum(is.na(x)))
+
+#Export file 
+write.csv(merged_liestal, "merged_liestal.csv", row.names = FALSE)
+```
+
+
+____________________________________________________________________________________________________
+## Vancouver
+```{r}
+#import bloom date data
+vancouver_bloom <-  cherry %>%
+  filter(year >= 1960) %>%
+  filter(location == "vancouver")
+
+
+#Filtering vancouver temperature
+vancouver_temp <- monthly_temp %>%
+  filter(location == "vancouver") %>%
+  filter(year >= 1960) 
+```
+
+```{r}
+# join the datasets based on the "year" column
+merged_vancouver <-left_join(vancouver_temp,vancouver_bloom, by='location')
+# view the merged dataset
+View(merged_vancouver)
+
+sapply(merged_vancouver, function(x) sum(is.na(x)))
+
+#Export file
+write.csv(merged_vancouver, "merged_vancouver.csv", row.names = FALSE)
+```
+
+### Adding 2 features to the dataset for modelling: 
+
